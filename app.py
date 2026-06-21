@@ -99,7 +99,8 @@ def classify(title, pub_type=""):
         "pub_types": [],
         "mesh_terms": [],
     }
-    return classify_reference(fake_record)
+    study_type, _criterion = classify_reference(fake_record)
+    return study_type
 
 # ── CrossRef helpers ───────────────────────────────────────────────────────────
 
@@ -222,7 +223,7 @@ def process_crossref_refs(raw_refs, guideline_name, ncbi_key, progress_bar, stat
             "doi":     ref.get("DOI",""),
             "pmid": "", "pubmed_url": "", "doi_url": "",
             "abstract": "", "pub_types": [], "mesh_terms": [],
-            "study_type_auto": "", "study_type": "",
+            "study_type_auto": "", "study_type": "", "classification_criterion": "",
             "pub_type_raw": "", "notes": "",
             "ref_raw": ref.get("unstructured",""),
         }
@@ -244,7 +245,7 @@ def process_crossref_refs(raw_refs, guideline_name, ncbi_key, progress_bar, stat
                 record["pubmed_url"] = f"https://pubmed.ncbi.nlm.nih.gov/{pm_result['pmid']}/"
                 record["abstract"] = pm_result.get("abstract", "")
                 record["pub_types"] = pm_result.get("pub_types", [])
-        record["study_type_auto"] = classify_reference(record)
+        record["study_type_auto"], record["classification_criterion"] = classify_reference(record)
         records.append(record)
     return records
 
@@ -297,6 +298,7 @@ def render_results(records, file_label):
         authors = r.get("authors",""); year = r.get("year",""); journal = r.get("journal","")
         meta = " · ".join(filter(None,[authors[:60]+("..." if len(authors)>60 else ""),year,journal[:40]]))
         pmid = r.get("pmid",""); doi = r.get("doi","")
+        criterion = r.get("classification_criterion","")
         links = ""
         if pmid: links += f'<a href="https://pubmed.ncbi.nlm.nih.gov/{pmid}/" target="_blank">PubMed →</a>'
         if doi:  links += f'<a href="https://doi.org/{doi}" target="_blank">DOI →</a>'
@@ -304,6 +306,7 @@ def render_results(records, file_label):
             <div class="ref-number">#{r.get('ref_number','')} &nbsp;{badge}</div>
             <div class="ref-title">{title}</div>
             <div class="ref-meta">{meta}</div>
+            {"<div style='font-size:0.72rem;color:#9AA3B5;margin-top:2px;'>Criterio: "+criterion+"</div>" if criterion else ""}
             {"<div class='ref-links'>"+links+"</div>" if links else ""}
             </div>""", unsafe_allow_html=True)
 
@@ -342,7 +345,7 @@ with tab1:
                         prog.progress(10+int(i/len(raw_refs)*85))
                         stat.markdown(f'<p style="font-size:0.8rem;color:#6B7A99;">[{i+1}/{len(raw_refs)}] {ref_text[:70]}...</p>', unsafe_allow_html=True)
                         record = enrich_reference(ref_text, i+1)
-                        record["study_type_auto"] = classify_reference(record)
+                        record["study_type_auto"], record["classification_criterion"] = classify_reference(record)
                         records.append(record)
                     os.unlink(tmp_path); prog.progress(100); stat.empty()
                     st.session_state["pdf_records"] = records
