@@ -238,24 +238,54 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
                 print(l)
         return []
 
-    # ── Clusterizar posiciones X de los marcadores para inferir columnas
-    xs = sorted(set(round(m["x0"]) for m in valid_markers))
-    column_clusters = []
-    for x in xs:
-        placed = False
-        for cluster in column_clusters:
-            if abs(x - cluster[-1]) < 20:
-                cluster.append(x)
-                placed = True
-                break
-        if not placed:
-            column_clusters.append([x])
-    column_centers = [sum(c) / len(c) for c in column_clusters]
-    dbg(f"[INFO] Columnas detectadas a partir de marcadores: {len(column_centers)} "
-        f"en x≈{[round(c) for c in column_centers]}")
+    # ── Clusterizar posiciones X de los marcadores POR PÁGINA (no
+    # globalmente) para inferir columnas. Esto es necesario porque
+    # algunos PDFs alternan el margen entre páginas pares/impares
+    # (formato libro: la columna "izquierda" puede estar en x≈42 en
+    # una página y en x≈72 en la siguiente), lo que rompería un
+    # clustering global de coordenadas X absolutas, fragmentando
+    # columnas reales en clusters falsos adicionales.
+    #
+    # En su lugar, para cada página se determina cuántas columnas
+    # tiene y se asigna a cada marcador un ÍNDICE de columna relativo
+    # a esa página (0 = más a la izquierda, 1 = siguiente, ...). Ese
+    # índice es estable entre páginas aunque el desplazamiento de
+    # margen cambie.
+    markers_by_page = {}
+    for m in valid_markers:
+        markers_by_page.setdefault(m["page"], []).append(m)
 
-    def nearest_column(x0):
-        return min(column_centers, key=lambda c: abs(c - x0))
+    page_column_centers = {}  # page_idx -> [x0_centro_col0, x0_centro_col1, ...]
+    for page_idx, page_markers in markers_by_page.items():
+        xs = sorted(set(round(m["x0"]) for m in page_markers))
+        clusters = []
+        for x in xs:
+            placed = False
+            for cluster in clusters:
+                if abs(x - cluster[-1]) < 20:
+                    cluster.append(x)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([x])
+        centers = sorted(sum(c) / len(c) for c in clusters)
+        page_column_centers[page_idx] = centers
+
+    n_columns_detected = max((len(c) for c in page_column_centers.values()), default=1)
+    dbg(f"[INFO] Columnas detectadas (máximo por página, recalculado página a página): "
+        f"{n_columns_detected}")
+
+    def column_index(page_idx, x0):
+        """Devuelve el índice de columna (0, 1, 2...) de una posición X
+        dentro de la página dada, usando los centros de columna ya
+        calculados para esa página específica."""
+        centers = page_column_centers.get(page_idx)
+        if not centers:
+            return 0
+        return min(range(len(centers)), key=lambda i: abs(centers[i] - x0))
+
+    def nearest_column(page_idx, x0):
+        return column_index(page_idx, x0)
 
     # ── Reconstruir el texto de cada referencia ───────────────────────────
     # Para delimitar el final de cada referencia usamos el SIGUIENTE
@@ -265,14 +295,16 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
     # estar en la columna de al lado, sin relación de continuidad visual.
     full_refs = []
     for i, mk in enumerate(valid_markers):
-        mk_column = nearest_column(mk["x0"])
+        mk_column = nearest_column(mk["page"], mk["x0"])
 
         # Buscar el siguiente marcador (en orden de número) que comparta
-        # la misma columna que el actual
+        # la misma columna que el actual (índice de columna relativo a
+        # SU PROPIA página, no coordenada X absoluta)
         next_mk = None
         for j in range(i + 1, len(valid_markers)):
-            if nearest_column(valid_markers[j]["x0"]) == mk_column:
-                next_mk = valid_markers[j]
+            candidate = valid_markers[j]
+            if nearest_column(candidate["page"], candidate["x0"]) == mk_column:
+                next_mk = candidate
                 break
 
         collected_words = [mk["rest"]] if mk["rest"].strip() else []
@@ -299,7 +331,10 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
                     else:
                         before_end = w["top"] < next_mk["top"] - 0.5
 
-                in_column = nearest_column(w["x0"]) == mk_column
+                # La columna de la palabra se calcula respecto a SU
+                # PROPIA página (no la del marcador), ya que el margen
+                # puede desplazarse de una página a otra
+                in_column = nearest_column(page_idx, w["x0"]) == mk_column
 
                 if after_start and before_end and in_column:
                     collected_words.append(w["text"])
@@ -321,6 +356,29 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
         return digit_ratio > 0.45 or text.count('|') > 2
 
     clean_refs = [r for r in full_refs if len(r) >= 20 and not looks_like_table_row(r)]
+
+    # ── Detectar huecos en la numeración final para informar al usuario.
+    # En casos raros, ciertas zonas del PDF tienen texto con codificación
+    # de fuente anómala (caracteres mal espaciados o superpuestos) que
+    # ningún ajuste de tolerancia logra reconstruir correctamente; cuando
+    # eso ocurre, esas referencias puntuales no se detectan como
+    # marcador válido. Se informa explícitamente en vez de fallar en
+    # silencio, para que el usuario sepa exactamente qué números faltan
+    # y pueda completarlos manualmente si lo necesita.
+    extracted_nums = set()
+    for r in clean_refs:
+        m = re.match(r'^(\d+)\.', r)
+        if m:
+            extracted_nums.add(int(m.group(1)))
+    if extracted_nums:
+        full_range = set(range(min(extracted_nums), max(extracted_nums) + 1))
+        gaps = sorted(full_range - extracted_nums)
+        if gaps:
+            dbg(f"[AVISO] {len(gaps)} número(s) de referencia no se pudieron "
+                f"extraer dentro del rango {min(extracted_nums)}-{max(extracted_nums)}: "
+                f"{gaps}. Esto suele deberse a zonas puntuales del PDF con "
+                f"codificación de fuente irregular (caracteres mal espaciados). "
+                f"Revisa esas referencias manualmente en el PDF original.")
 
     dbg(f"[INFO] Referencias extraídas (total final, tras limpieza): {len(clean_refs)}")
     if not debug:
