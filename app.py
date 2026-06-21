@@ -81,12 +81,25 @@ CLASSIFICATION_RULES = {
 }
 
 def classify(title, pub_type=""):
-    text = (title+" "+pub_type).lower()
-    for st_type in ["RCT_secundario","meta-analisis","guia_clinica","registro_observacional","RCT_primario"]:
-        for pat in CLASSIFICATION_RULES[st_type]:
-            if re.search(pat, text, re.IGNORECASE):
-                return st_type
-    return "otro/no_clasificado"
+    """
+    DEPRECATED: usar classify_reference() de pipeline.py, que tiene
+    acceso a la clasificación de 3 capas (Publication Types oficiales
+    de PubMed + keywords + vocabulario de intervención). Esta función
+    se mantiene solo por compatibilidad de firma, pero internamente
+    delega en classify_reference para no duplicar lógica de
+    clasificación en dos sitios distintos del código (lo cual causó
+    que las guías ESC/ACC-AHA se clasificaran mal en este flujo: esta
+    versión vieja no tenía acceso a pub_types/mesh_terms reales).
+    """
+    fake_record = {
+        "title": title,
+        "ref_raw": "",
+        "pub_type_raw": pub_type,
+        "journal": "",
+        "pub_types": [],
+        "mesh_terms": [],
+    }
+    return classify_reference(fake_record)
 
 # ── CrossRef helpers ───────────────────────────────────────────────────────────
 
@@ -157,7 +170,15 @@ def enrich_doi_crossref(doi: str) -> dict:
     except:
         return {}
 
-def search_pmid(title: str, year: str = "", api_key: str = "") -> str:
+def search_pmid(title: str, year: str = "", api_key: str = "") -> dict:
+    """
+    Busca PMID en PubMed y, si lo encuentra, también recupera el
+    abstract y los Publication Types reales (vía efetch), igual que
+    hace pipeline.py para el flujo de extracción por PDF. Antes esta
+    función solo devolvía el PMID (string) y dejaba el abstract vacío
+    en el Excel para las referencias procesadas por DOI/nombre.
+    Devuelve un dict: {"pmid": str, "abstract": str, "pub_types": list}
+    """
     words = re.findall(r'\b[A-Za-z]{4,}\b', title)
     query = " ".join(words[:8])
     if year: query += f"[Title/Abstract] AND {year}[PDAT]"
@@ -167,9 +188,25 @@ def search_pmid(title: str, year: str = "", api_key: str = "") -> str:
         r = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                          params=params, timeout=10)
         ids = r.json().get("esearchresult",{}).get("idlist",[])
-        return ids[0] if ids else ""
+        if not ids:
+            return {"pmid": "", "abstract": "", "pub_types": []}
+        pmid = ids[0]
+
+        # Recuperar abstract + Publication Types con una segunda
+        # llamada (efetch), igual que hace pipeline.py
+        fetch_params = {"db": "pubmed", "id": pmid, "retmode": "xml", "rettype": "abstract"}
+        if api_key: fetch_params["api_key"] = api_key
+        rf = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+                          params=fetch_params, timeout=10)
+        xml = rf.text
+        abstract_blocks = re.findall(r'<AbstractText[^>]*>(.*?)</AbstractText>', xml, re.DOTALL)
+        abstract = " ".join(b.strip() for b in abstract_blocks) if abstract_blocks else ""
+        abstract = re.sub(r'<[^>]+>', '', abstract).strip()
+        pub_types = re.findall(r'<PublicationType[^>]*>(.*?)</PublicationType>', xml)
+
+        return {"pmid": pmid, "abstract": abstract, "pub_types": pub_types}
     except:
-        return ""
+        return {"pmid": "", "abstract": "", "pub_types": []}
 
 def process_crossref_refs(raw_refs, guideline_name, ncbi_key, progress_bar, status_text):
     records = []
@@ -184,6 +221,7 @@ def process_crossref_refs(raw_refs, guideline_name, ncbi_key, progress_bar, stat
             "journal": ref.get("journal-title","") or ref.get("volume-title",""),
             "doi":     ref.get("DOI",""),
             "pmid": "", "pubmed_url": "", "doi_url": "",
+            "abstract": "", "pub_types": [], "mesh_terms": [],
             "study_type_auto": "", "study_type": "",
             "pub_type_raw": "", "notes": "",
             "ref_raw": ref.get("unstructured",""),
@@ -200,11 +238,13 @@ def process_crossref_refs(raw_refs, guideline_name, ncbi_key, progress_bar, stat
             record["doi_url"] = f"https://doi.org/{record['doi']}"
         if record["title"] and len(record["title"]) > 15:
             time.sleep(0.35)
-            pmid = search_pmid(record["title"], record.get("year",""), ncbi_key)
-            if pmid:
-                record["pmid"] = pmid
-                record["pubmed_url"] = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-        record["study_type_auto"] = classify(record["title"], record.get("pub_type_raw",""))
+            pm_result = search_pmid(record["title"], record.get("year",""), ncbi_key)
+            if pm_result.get("pmid"):
+                record["pmid"] = pm_result["pmid"]
+                record["pubmed_url"] = f"https://pubmed.ncbi.nlm.nih.gov/{pm_result['pmid']}/"
+                record["abstract"] = pm_result.get("abstract", "")
+                record["pub_types"] = pm_result.get("pub_types", [])
+        record["study_type_auto"] = classify_reference(record)
         records.append(record)
     return records
 
@@ -279,7 +319,7 @@ with tab1:
     with col_l:
         st.markdown("#### Subir guía clínica en PDF")
         uploaded = st.file_uploader("PDF", type=["pdf"], label_visibility="collapsed")
-        st.markdown('<p style="font-size:0.82rem;color:#6B7A99;">Funciona con cualquier guía en PDF.<br>Layouts de 1 y 2 columnas.</p>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:0.82rem;color:#6B7A99;">Funciona con cualquier guía en PDF.<br>Detecta automáticamente el número de columnas de cada página.</p>', unsafe_allow_html=True)
     with col_r:
         if uploaded is None:
             st.markdown("""<div style="background:#F8FAFD;border:2px dashed #C5D4E8;border-radius:12px;
