@@ -563,6 +563,7 @@ def enrich_reference(ref_text: str, idx: int) -> dict:
         "abstract": "",
         "study_type": "",
         "study_type_auto": "",
+        "classification_criterion": "",
         "pubmed_url": "",
         "doi_url": "",
         "source_api": "",
@@ -583,6 +584,7 @@ def enrich_reference(ref_text: str, idx: int) -> dict:
     if is_web_source:
         record["notes"] = "Fuente web/institucional (no indexada en PubMed/CrossRef)"
         record["study_type_auto"] = "fuente_web/institucional"
+        record["classification_criterion"] = "Detección por patrón de cita web/institucional ('Available at: http://...') antes de cualquier búsqueda PubMed/CrossRef"
         url_m = re.search(r'(https?://\S+)', ref_text)
         if url_m:
             record["doi_url"] = url_m.group(1).rstrip('.')
@@ -651,16 +653,15 @@ CLASSIFICATION_RULES = {
         r'\brandom(ized|ised)\s+(clinical|controlled)\s+trial\b',
         r'\bRCT\b', r'\bensayo\s+cl[ií]nico\b', r'\brandomizado\b',
         r'\bprimary\s+(result|endpoint|outcome)\b',
-        # Nombres de trials clásicos en texto crudo
-        r'\bPURSUIT\b', r'\bPRISM\b', r'\bTIMI\s+III\b', r'\bGUSTO\b',
-        r'\bCURE\b', r'\bACUITY\b', r'\bTRILOGY\b', r'\bPLATO\b',
-        r'\bBRILLIANT\b', r'\bTARGET\b', r'\bSYNERGY\b',
         r'\btrial\b.*\bplacebo\b', r'\bversus\b.*\bplacebo\b',
     ],
     "RCT_secundario": [
         r'\bsubgroup\s+anal', r'\bpost.hoc\b', r'\bsecondary\s+anal',
         r'\bsub-?study\b', r'\bpre.specified\b', r'\bpost\s+hoc\b',
         r'\bsubstudy\b', r'\bsub\s+analysis\b',
+        r'\binsights\s+from\b', r'\bobservations\s+from\b',
+        r'\ba\s+substudy\s+of\b', r'\bsecondary\s+(endpoint|outcome)\b',
+        r'\bpredictors?\s+of\s+outcome\b', r'\bexploratory\s+analysis\b',
     ],
     "meta-analisis": [
         r'\bmeta.anal', r'\bsystematic\s+review\b', r'\bpooled\s+anal',
@@ -715,42 +716,58 @@ PUBMED_TYPE_MAP = {
     "Government Publications":                  None,
 }
 
-def classify_reference(record: dict) -> str:
+def classify_reference(record: dict) -> tuple:
     """
     Clasificación en 3 capas de precisión decreciente:
     1. Publication Types oficiales de PubMed (más fiable)
     2. Palabras clave en título + texto crudo + journal
     3. Fallback por tipo CrossRef + vocabulario de intervención
+
+    Devuelve una tupla (study_type, criterio) donde 'criterio' es una
+    descripción legible de la regla exacta que disparó la clasificación,
+    para que sea auditable caso por caso (columna 'Criterio' en el Excel).
     """
 
     # ── CAPA 1: Publication Types de PubMed ─────────────────────────────
     pub_types = record.get("pub_types", [])  # lista de strings de PubMed
     if pub_types:
-        # Prioridad: RCT_secundario se detecta por combinación de tipos
         type_str = " | ".join(pub_types)
 
         # Subanálisis: Clinical Trial + sin "Randomized" = probable secundario
         if any("Randomized" in t for t in pub_types):
             if any(kw in type_str for kw in ["Subgroup", "Secondary", "Post-Hoc"]):
-                return "RCT_secundario"
+                return "RCT_secundario", f"PubMed Publication Type contiene 'Randomized' + indicador de subanálisis ({type_str})"
 
         # Meta-análisis y revisiones sistemáticas
         if any(t in ("Meta-Analysis", "Systematic Review") for t in pub_types):
-            return "meta-analisis"
+            return "meta-analisis", f"PubMed Publication Type = Meta-Analysis/Systematic Review ({type_str})"
 
         # Guías clínicas
         if any(t in ("Practice Guideline", "Guideline",
                      "Consensus Development Conference",
                      "Consensus Development Conference, NIH") for t in pub_types):
-            return "guia_clinica"
+            return "guia_clinica", f"PubMed Publication Type = Guideline/Practice Guideline/Consensus ({type_str})"
 
-        # ECA primario
+        # ECA primario: requiere "Randomized Controlled Trial" Y que el
+        # título/texto NO contenga señales de ser un análisis derivado
+        # (subanálisis, subgrupo, post-hoc, secundario) que PubMed no
+        # siempre marca explícitamente en sus Publication Types.
         if any(t == "Randomized Controlled Trial" for t in pub_types):
-            return "RCT_primario"
+            derived_analysis_patterns = [
+                r'\bsub.?group\b', r'\bsubanalysis\b', r'\bsub.?analysis\b',
+                r'\bpost.?hoc\b', r'\bsecondary\s+analysis\b',
+                r'\bsecondary\s+(endpoint|outcome)\b',
+                r'\bpre.?specified\s+analysis\b', r'\bexploratory\s+analysis\b',
+            ]
+            check_text = " ".join(filter(None, [record.get("title", ""), record.get("ref_raw", "")]))
+            for pat in derived_analysis_patterns:
+                if re.search(pat, check_text, re.IGNORECASE):
+                    return "RCT_secundario", f"PubMed = Randomized Controlled Trial, pero título/texto indica análisis derivado ('{pat}')"
+            return "RCT_primario", f"PubMed Publication Type = Randomized Controlled Trial ({type_str})"
 
         # Observacional
         if any(t in ("Observational Study",) for t in pub_types):
-            return "registro_observacional"
+            return "registro_observacional", f"PubMed Publication Type = Observational Study ({type_str})"
 
     # ── CAPA 2: Palabras clave en todos los campos de texto ──────────────
     text_to_search = " ".join(filter(None, [
@@ -765,18 +782,29 @@ def classify_reference(record: dict) -> str:
                         "registro_observacional", "RCT_primario"]:
         for pat in CLASSIFICATION_RULES[study_type]:
             if re.search(pat, text_to_search, re.IGNORECASE):
-                return study_type
+                return study_type, f"Palabra clave en título/texto/journal/MeSH: patrón '{pat}'"
 
     # ── CAPA 3: Fallback por vocabulario de intervención ─────────────────
+    # NOTA: esta capa es deliberadamente la de menor confianza. Solo debe
+    # usarse cuando no hay pub_types ni ninguna keyword de capa 2, y aun
+    # así requiere que el vocabulario de intervención aparezca junto a
+    # una señal mínima de diseño comparativo (no basta con "effect of"
+    # solo, que aparece igual en series de casos u observacionales).
     if record.get("pub_type_raw") == "journal-article":
         title = record.get("title", "")
-        for pat in [r'\beffect\s+of\b', r'\befficacy\b',
-                    r'\bsafety\s+and\s+efficacy\b', r'\bversus\b',
-                    r'\bcompar(ing|ison)\b', r'\bbenefit\s+of\b']:
-            if re.search(pat, title, re.IGNORECASE):
-                return "RCT_primario"
+        comparative_design_patterns = [
+            r'\brandomi[sz]ed\b', r'\bplacebo\b', r'\btrial\b',
+            r'\bdouble.blind\b', r'\bopen.label\b',
+        ]
+        has_comparative_signal = any(re.search(p, title, re.IGNORECASE) for p in comparative_design_patterns)
+        if has_comparative_signal:
+            for pat in [r'\beffect\s+of\b', r'\befficacy\b',
+                        r'\bsafety\s+and\s+efficacy\b', r'\bversus\b',
+                        r'\bcompar(ing|ison)\b', r'\bbenefit\s+of\b']:
+                if re.search(pat, title, re.IGNORECASE):
+                    return "RCT_primario", f"Sin pub_types/keywords; vocabulario de intervención ('{pat}') + señal de diseño comparativo en título"
 
-    return "otro/no_clasificado"
+    return "otro/no_clasificado", "No coincide con ningún patrón de las 3 capas (PubMed, keywords, vocabulario de intervención)"
 
 
 # ─────────────────────────────────────────────
@@ -836,7 +864,7 @@ def export_to_excel(records: list[dict], output_path: str):
         ("N°", 5), ("Autores", 30), ("Año", 6), ("Título", 50),
         ("Revista", 25), ("PMID", 12), ("DOI", 30),
         ("URL PubMed", 35), ("URL DOI", 35),
-        ("Tipo (auto)", 20), ("Tipo (manual)", 20),
+        ("Tipo (auto)", 20), ("Criterio", 45), ("Tipo (manual)", 20),
         ("Notas", 25), ("Abstract", 60), ("Referencia original", 50),
     ]
 
@@ -872,6 +900,7 @@ def export_to_excel(records: list[dict], output_path: str):
             r.get("pubmed_url", ""),
             r.get("doi_url", ""),
             r.get("study_type_auto", ""),
+            r.get("classification_criterion", ""),
             r.get("study_type", ""),  # campo para corrección manual
             r.get("notes", ""),
             r.get("abstract", ""),
@@ -880,7 +909,7 @@ def export_to_excel(records: list[dict], output_path: str):
 
         for col_idx, val in enumerate(values, 1):
             cell = ws_all.cell(row=row_num, column=col_idx, value=val)
-            style_cell(cell, row_color=row_color, wrap=(col_idx in [4, 13, 14]))
+            style_cell(cell, row_color=row_color, wrap=(col_idx in [4, 11, 14, 15]))
             # Hipervínculos
             if col_idx == 8 and val:
                 cell.hyperlink = val
@@ -914,7 +943,8 @@ def _write_rct_sheet(ws, records):
     cols = [
         ("N°", 5), ("Autores", 30), ("Año", 6), ("Título", 50),
         ("Revista", 25), ("PMID", 12), ("DOI", 30),
-        ("URL PubMed", 35), ("URL DOI", 35), ("Notas", 30), ("Abstract", 60),
+        ("URL PubMed", 35), ("URL DOI", 35), ("Criterio", 45),
+        ("Notas", 30), ("Abstract", 60),
     ]
     ws.row_dimensions[1].height = 30
     for col_idx, (col_name, col_width) in enumerate(cols, 1):
@@ -928,12 +958,12 @@ def _write_rct_sheet(ws, records):
         values = [
             r.get("ref_number"), r.get("authors"), r.get("year"),
             r.get("title"), r.get("journal"), r.get("pmid"), r.get("doi"),
-            r.get("pubmed_url"), r.get("doi_url"), r.get("notes"),
-            r.get("abstract"),
+            r.get("pubmed_url"), r.get("doi_url"), r.get("classification_criterion"),
+            r.get("notes"), r.get("abstract"),
         ]
         for col_idx, val in enumerate(values, 1):
             cell = ws.cell(row=row_num, column=col_idx, value=val)
-            style_cell(cell, row_color=COLORS["rct_primary"], wrap=(col_idx in [4, 11]))
+            style_cell(cell, row_color=COLORS["rct_primary"], wrap=(col_idx in [4, 10, 12]))
             if col_idx == 8 and val:
                 cell.hyperlink = val
                 cell.font = Font(name="Arial", size=9, color="0563C1", underline="single")
@@ -1070,7 +1100,7 @@ def run_pipeline(pdf_path: str, output_path: str = "references_db.xlsx"):
     for idx, ref_text in enumerate(raw_refs, 1):
         print(f"  [{idx}/{len(raw_refs)}] {ref_text[:80]}...", end="\r")
         record = enrich_reference(ref_text, idx)
-        record["study_type_auto"] = classify_reference(record)
+        record["study_type_auto"], record["classification_criterion"] = classify_reference(record)
         records.append(record)
 
     print(f"\n\n[INFO] Clasificación:")
