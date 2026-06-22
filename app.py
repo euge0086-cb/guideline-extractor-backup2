@@ -9,6 +9,8 @@ Modos:
 import streamlit as st
 import tempfile, os, time, re, requests
 from pipeline import extract_references_from_pdf, enrich_reference, classify_reference, export_to_excel
+from pipeline_recommendations import (extract_recommendations_from_pdf,
+                                      export_recommendations_to_excel)
 
 st.set_page_config(page_title="Guideline Reference Extractor", page_icon="📚", layout="wide")
 
@@ -310,11 +312,175 @@ def render_results(records, file_label):
             {"<div class='ref-links'>"+links+"</div>" if links else ""}
             </div>""", unsafe_allow_html=True)
 
+# ── Render recomendaciones ─────────────────────────────────────────────────────
+
+_REC_CLASS_BADGE = {
+    'I':           '<span style="background:#E2EFDA;color:#1B5E20;border:1px solid #A5D6A7;border-radius:5px;padding:2px 8px;font-size:0.78rem;font-weight:700;">Clase I</span>',
+    'IIa':         '<span style="background:#FFF9C4;color:#F57F17;border:1px solid #FFE082;border-radius:5px;padding:2px 8px;font-size:0.78rem;font-weight:700;">Clase IIa</span>',
+    'IIb':         '<span style="background:#FCE4D6;color:#BF360C;border:1px solid #FFAB91;border-radius:5px;padding:2px 8px;font-size:0.78rem;font-weight:700;">Clase IIb</span>',
+    'III':         '<span style="background:#FFEBEE;color:#B71C1C;border:1px solid #EF9A9A;border-radius:5px;padding:2px 8px;font-size:0.78rem;font-weight:700;">Clase III</span>',
+    'Desconocida': '<span style="background:#F5F5F5;color:#616161;border:1px solid #BDBDBD;border-radius:5px;padding:2px 8px;font-size:0.78rem;font-weight:700;">?</span>',
+}
+_LOE_BADGE = {
+    'A':           '<span style="background:#DAE8FC;color:#1565C0;border:1px solid #90CAF9;border-radius:5px;padding:2px 7px;font-size:0.78rem;font-weight:700;">LOE A</span>',
+    'B':           '<span style="background:#E1D5E7;color:#4527A0;border:1px solid #B39DDB;border-radius:5px;padding:2px 7px;font-size:0.78rem;font-weight:700;">LOE B</span>',
+    'C':           '<span style="background:#F5F5F5;color:#616161;border:1px solid #BDBDBD;border-radius:5px;padding:2px 7px;font-size:0.78rem;font-weight:700;">LOE C</span>',
+    'Desconocida': '<span style="background:#F5F5F5;color:#9E9E9E;border:1px solid #E0E0E0;border-radius:5px;padding:2px 7px;font-size:0.78rem;font-weight:700;">LOE ?</span>',
+}
+_REC_CLASS_COLOR = {
+    'I': '#E2EFDA', 'IIa': '#FFF9C4', 'IIb': '#FCE4D6',
+    'III': '#FFEBEE', 'Desconocida': '#F5F5F5',
+}
+_REC_CLASS_DESC = {
+    'I':   'Beneficio >> riesgo. Indicado.',
+    'IIa': 'Beneficio > riesgo. Razonable.',
+    'IIb': 'Beneficio ≥ riesgo. Puede considerarse.',
+    'III': 'Sin beneficio / dañino.',
+}
+
+
+def _build_rec_excel(recs):
+    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+        tmp_path = tmp.name
+    export_recommendations_to_excel(recs, tmp_path)
+    with open(tmp_path, 'rb') as f:
+        data = f.read()
+    os.unlink(tmp_path)
+    return data
+
+
+def render_recommendations(recommendations, file_label):
+    # ─ Botón de descarga
+    st.download_button(
+        '⬇️  Descargar Excel de recomendaciones',
+        data=_build_rec_excel(recommendations),
+        file_name=f'recomendaciones_{file_label}.xlsx',
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        use_container_width=True, type='primary',
+    )
+    st.markdown('---')
+
+    CLASS_ORDER = ['I', 'IIa', 'IIb', 'III', 'Desconocida']
+    LOE_ORDER   = ['A', 'B', 'C', 'Desconocida']
+
+    counts_class = {}
+    counts_loe   = {}
+    for r in recommendations:
+        c = r.get('rec_class', 'Desconocida')
+        l = r.get('loe',       'Desconocida')
+        counts_class[c] = counts_class.get(c, 0) + 1
+        counts_loe[l]   = counts_loe.get(l, 0)   + 1
+
+    # ─ Distribución por clase
+    st.markdown('#### Distribución por clase')
+    present_cls = [c for c in CLASS_ORDER if c in counts_class]
+    cols_c = st.columns(min(len(present_cls), 5))
+    for i, cls in enumerate(present_cls):
+        with cols_c[i % 5]:
+            n   = counts_class[cls]
+            pct = n / len(recommendations) * 100 if recommendations else 0
+            st.markdown(f"""
+            <div style="background:{_REC_CLASS_COLOR.get(cls,'#eee')};border-radius:8px;
+                padding:1rem;text-align:center;border-top:3px solid #ccc;margin-bottom:8px;">
+              <div style="font-size:2rem;font-weight:700;color:#0A2342;">{n}</div>
+              <div style="font-size:0.85rem;font-weight:600;">Clase {cls}</div>
+              <div style="font-size:0.72rem;color:#777;">{pct:.0f}% · {_REC_CLASS_DESC.get(cls,'')}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ─ Tabla Clase × LOE
+    st.markdown('#### Distribución Clase × LOE')
+    from collections import defaultdict
+    matrix = defaultdict(lambda: defaultdict(int))
+    for r in recommendations:
+        matrix[r.get('rec_class','Desconocida')][r.get('loe','Desconocida')] += 1
+
+    present_loe = [l for l in LOE_ORDER if l in counts_loe]
+    loe_th = ''.join(
+        f'<th style="background:#1F4E79;color:white;padding:5px 14px;text-align:center;">LOE {l}</th>'
+        for l in present_loe
+    )
+    rows_html = ''
+    for cls in present_cls:
+        cells = ''.join(
+            f'<td style="text-align:center;font-weight:600;padding:4px 10px;">'
+            f'{matrix[cls].get(l,"") or ""}</td>'
+            for l in present_loe
+        )
+        bg = _REC_CLASS_COLOR.get(cls, '#F5F5F5')
+        rows_html += (
+            f'<tr><td style="background:{bg};font-weight:700;padding:5px 10px;">'
+            f'Clase {cls}</td>{cells}</tr>'
+        )
+    st.markdown(
+        f'<table style="border-collapse:collapse;font-family:Arial;font-size:0.85rem;'
+        f'margin-bottom:1rem;"><thead><tr>'
+        f'<th style="background:#1F4E79;color:white;padding:5px 14px;text-align:left;">'
+        f'Clase / LOE</th>{loe_th}</tr></thead><tbody>{rows_html}</tbody></table>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('---')
+    st.markdown('#### Recomendaciones')
+
+    # ─ Filtros
+    fc1, fc2, fc3 = st.columns([2, 1, 1])
+    with fc1:
+        q_rec = st.text_input('Buscar en texto...', placeholder='término clave',
+                              label_visibility='collapsed', key=f'q_rec_{file_label}')
+    with fc2:
+        f_cls = st.selectbox('Clase', ['Todas'] + CLASS_ORDER,
+                             label_visibility='collapsed', key=f'f_cls_{file_label}')
+    with fc3:
+        f_loe = st.selectbox('LOE', ['Todos'] + LOE_ORDER,
+                             label_visibility='collapsed', key=f'f_loe_{file_label}')
+
+    filtered = recommendations
+    if f_cls != 'Todas':
+        filtered = [r for r in filtered if r.get('rec_class') == f_cls]
+    if f_loe != 'Todos':
+        filtered = [r for r in filtered if r.get('loe') == f_loe]
+    if q_rec:
+        ql = q_rec.lower()
+        filtered = [r for r in filtered if ql in r.get('text', '').lower()]
+
+    st.markdown(
+        f'<p style="font-size:0.82rem;color:#9AA3B5;">{len(filtered)} recomendaciones</p>',
+        unsafe_allow_html=True,
+    )
+
+    for r in filtered:
+        cls  = r.get('rec_class', 'Desconocida')
+        loe  = r.get('loe',       'Desconocida')
+        text = r.get('text', '')
+        refs = r.get('references_cited', '')
+        page = r.get('page', '')
+        bg   = _REC_CLASS_COLOR.get(cls, '#F5F5F5')
+        refs_html = (f'<span style="font-size:0.75rem;color:#6B7A99;">📎 Refs: {refs}</span>'
+                     if refs else '')
+        page_html = (f'<span style="font-size:0.75rem;color:#9AA3B5;margin-left:10px;">p. {page}</span>'
+                     if page else '')
+        st.markdown(f"""
+        <div style="background:white;border:1px solid #E8EDF5;border-left:4px solid {bg};
+            border-radius:8px;padding:0.9rem 1.1rem;margin-bottom:0.5rem;">
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+            <span style="font-family:monospace;font-size:0.75rem;color:#9AA3B5;">
+              #{r.get('rec_number','')}</span>
+            {_REC_CLASS_BADGE.get(cls,'')}&nbsp;{_LOE_BADGE.get(loe,'')}{page_html}
+          </div>
+          <div style="font-size:0.9rem;color:#0A2342;line-height:1.5;">{text}</div>
+          <div style="margin-top:6px;">{refs_html}</div>
+        </div>""", unsafe_allow_html=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2 = st.tabs(["📄  Subir PDF", "🔍  Buscar guía por nombre o DOI"])
+tab1, tab2, tab3 = st.tabs([
+    '📄  Subir PDF',
+    '🔍  Buscar guía por nombre o DOI',
+    '📋  Recomendaciones',
+])
 
 # ── TAB 1: PDF ────────────────────────────────────────────────────────────────
 with tab1:
@@ -477,3 +643,103 @@ with tab2:
                 for k in ["selected_doi","selected_nombre","search_results","search_query"]:
                     if k in st.session_state: del st.session_state[k]
                 st.rerun()
+
+# ── TAB 3: RECOMENDACIONES ────────────────────────────────────────────────────
+with tab3:
+    st.markdown("""
+    <div style="background:#0A2342;border-radius:10px;padding:1.2rem 1.5rem;margin-bottom:1.5rem;">
+      <div style="font-size:1rem;font-weight:600;color:white;margin-bottom:4px;">
+        📋 Extractor de Recomendaciones
+      </div>
+      <div style="font-size:0.85rem;color:rgba(255,255,255,0.75);">
+        Extrae automáticamente las recomendaciones de una guía clínica en PDF,
+        clasificadas por <b style="color:white;">Clase</b> (I / IIa / IIb / III)
+        y <b style="color:white;">Nivel de Evidencia</b> (A / B / C).
+        Funciona con guías ESC, ACC/AHA y formatos similares.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_l3, col_r3 = st.columns([1, 2], gap='large')
+
+    with col_l3:
+        st.markdown('#### PDF de la guía clínica')
+        uploaded_rec = st.file_uploader(
+            'PDF', type=['pdf'], label_visibility='collapsed', key='uploader_rec'
+        )
+        st.markdown("""
+        <p style="font-size:0.82rem;color:#6B7A99;">
+        El extractor utiliza dos estrategias complementarias:<br>
+        <b>① Por tablas</b>: detecta columnas Recomendación / Clase / LOE.<br>
+        <b>② Por texto</b>: busca patrones como
+        <code>(Class I; Level of Evidence: A)</code> en texto corrido.
+        </p>
+        <div style="background:#FFF8E1;border:1px solid #FFE082;border-radius:8px;
+            padding:0.8rem 1rem;margin-top:0.5rem;font-size:0.8rem;color:#5D4037;">
+        <b>ℹ️ Precisión esperada</b><br>
+        Guías con tablas bien estructuradas (ESC 2016+, ACC/AHA): ~90 %.<br>
+        Guías con cajas de texto o columnas dobles: ~70–80 %.<br>
+        La columna <em>Clase (manual)</em> del Excel permite correcciones.
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_r3:
+        if uploaded_rec is None:
+            st.markdown("""
+            <div style="background:#F8FAFD;border:2px dashed #C5D4E8;border-radius:12px;
+                padding:3rem 2rem;text-align:center;color:#6B7A99;">
+              <div style="font-size:3rem;margin-bottom:1rem;">📋</div>
+              <div style="font-size:1.1rem;font-weight:600;color:#0A2342;margin-bottom:0.5rem;">
+                Sube un PDF para extraer recomendaciones</div>
+              <div style="font-size:0.85rem;">
+                Detecta automáticamente clase (I/IIa/IIb/III)<br>
+                y nivel de evidencia (A/B/C).
+              </div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            rec_cache_key = f'rec_{uploaded_rec.name}'
+
+            if rec_cache_key not in st.session_state:
+                if st.button('📋 Extraer recomendaciones', type='primary',
+                             use_container_width=True, key='btn_rec'):
+                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                        tmp.write(uploaded_rec.read())
+                        tmp_path_rec = tmp.name
+
+                    prog_r = st.progress(0)
+                    stat_r = st.empty()
+                    stat_r.markdown('**Analizando PDF en busca de recomendaciones...**')
+                    prog_r.progress(20)
+
+                    try:
+                        recs = extract_recommendations_from_pdf(tmp_path_rec)
+                    except Exception as e:
+                        recs = []
+                        st.error(f'Error durante la extracción: {e}')
+                    finally:
+                        os.unlink(tmp_path_rec)
+
+                    prog_r.progress(100)
+                    stat_r.empty()
+
+                    if not recs:
+                        st.warning(
+                            'No se encontraron recomendaciones con los patrones habituales.\n\n'
+                            'Posibles causas:\n'
+                            '- La guía usa formato de tabla no estándar o imágenes escaneadas.\n'
+                            '- Las recomendaciones no llevan marcadores de clase/LOE explícitos.\n\n'
+                            'Verifica que el PDF es de texto seleccionable (no escaneado).'
+                        )
+                    else:
+                        st.session_state[rec_cache_key] = recs
+                        st.rerun()
+
+            if rec_cache_key in st.session_state:
+                recs = st.session_state[rec_cache_key]
+                st.success(
+                    f'✅ {len(recs)} recomendaciones extraídas de **{uploaded_rec.name}**'
+                )
+                render_recommendations(recs, uploaded_rec.name.replace('.pdf', ''))
+                if st.button('🔄 Procesar otro PDF', key='reset_rec'):
+                    del st.session_state[rec_cache_key]
+                    st.rerun()
